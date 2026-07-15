@@ -32,4 +32,5 @@
 - [ ] [NuExtract3](https://github.com/numindai/nuextract)
 - [ ] [Falcon-OCR](https://huggingface.co/tiiuae/Falcon-OCR)
 - [ ] [Unlimited-OCR](https://modelscope.cn/models/PaddlePaddle/Unlimited-OCR/summary)
+- [ ] [OvisOCR2](https://huggingface.co/ATH-MaaS/OvisOCR2)
 ---
