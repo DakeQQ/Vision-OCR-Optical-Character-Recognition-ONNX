@@ -1,9 +1,11 @@
-"""Optimize SuryaOCR's merged ONNX bundle through the shared OCR optimizer."""
+"""Optimize OvisOCR2's merged ONNX bundle through the shared OCR optimizer."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -11,13 +13,18 @@ import onnx
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from OCR_Tokenizer_Assets import copy_tokenizer_assets
-
-COMMON_PATH = (REPO_ROOT / "Optimize_ONNX_Common.py").resolve()
+os.environ.setdefault(
+    "NUMBA_CACHE_DIR",
+    str(Path("/tmp") / "ovisocr2_numba_cache"),
+)
+SHARED_OPTIMIZE_ONNX_COMMON = (
+    SCRIPT_DIR.parent.parent / "Optimize_ONNX_Common.py"
+).resolve()
+if not SHARED_OPTIMIZE_ONNX_COMMON.is_file():
+    raise FileNotFoundError(
+        "Approved Optimize_ONNX_Common.py does not exist: "
+        f"{SHARED_OPTIMIZE_ONNX_COMMON}"
+    )
 
 
 def _load_local_module(module_name: str, path: Path):
@@ -34,17 +41,17 @@ def _load_local_module(module_name: str, path: Path):
     return module
 
 
-Shared_Merged = _load_local_module("_suryaocr_shared_merged", SCRIPT_DIR / "Shared_Merged.py")
-_common = _load_local_module("_suryaocr_optimizer_common", COMMON_PATH)
+Shared_Merged = _load_local_module("_ovisocr2_shared_merged", SCRIPT_DIR / "Shared_Merged.py")
+_common = _load_local_module("_ovisocr2_optimizer_common", SHARED_OPTIMIZE_ONNX_COMMON)
 OptimizerConfig = _common.OptimizerConfig
 Plan = _common.Plan
 run_optimizer = _common.run_optimizer
 
 
 # Bundle paths
-SOURCE_BUNDLE_DIR    = SCRIPT_DIR / "SuryaOCR_ONNX"
-OPTIMIZED_BUNDLE_DIR = SCRIPT_DIR / "SuryaOCR_Optimized"
-CHECKPOINT_DIR       = Path.home() / "Downloads" / "surya-ocr-2"
+SOURCE_BUNDLE_DIR    = SCRIPT_DIR / "OvisOCR2_ONNX"
+OPTIMIZED_BUNDLE_DIR = SCRIPT_DIR / "OvisOCR2_Optimized"
+CHECKPOINT_DIR       = SCRIPT_DIR
 ORIGINAL_FOLDER_PATH = SOURCE_BUNDLE_DIR
 QUANTED_FOLDER_PATH  = OPTIMIZED_BUNDLE_DIR
 DOWNLOAD_PATH        = CHECKPOINT_DIR
@@ -53,7 +60,25 @@ DOWNLOAD_PATH        = CHECKPOINT_DIR
 QUANT_METHOD          = "Q4"
 WEIGHT_ONLY_ALGORITHM = "AFFINE_REFINE_V2"
 _AFFINE_REFINE_V2_METHODS = ("Q4", "Q8")
-KV_BLOCKED_QDQ_SURGERY = False  # Enable only for CPU runtimes supporting blocked Q/DQ.
+
+# Runtime asset policy
+TOKENIZER_ASSET_NAMES = (
+    "added_tokens.json",
+    "chat_template.jinja",
+    "config.json",
+    "configuration.json",
+    "merges.txt",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "video_preprocessor_config.json",
+    "vocab.json",
+)
+REQUIRED_TOKENIZER_ASSET_NAMES = ("tokenizer.json", "tokenizer_config.json", "vocab.json")
+KV_HELPER_ROLES = ("kv_slice", "kv_split2", "kv_concat", "rope_shift")
 
 # Per-graph optimization plans
 _PRIMARY_MERGED_MODEL = Path(
@@ -64,19 +89,15 @@ MODEL_PLANS: dict[str, Plan] = {
     _PRIMARY_MERGED_MODEL: Plan(
         method=QUANT_METHOD,
         external=True,
-        # The generic transformer optimizer can stall on Surya's nested
-        # If/Loop/Sequence recurrent-state graph. Preserve the quantized
-        # control flow and validate every transplanted strategy graph instead.
+        # The generic transformer optimizer can stall on Ovis's nested
+        # If/Loop/Sequence recurrent-state graph. Keep the quantized control
+        # flow unchanged; shared-bundle validation still checks every strategy.
         optimize=False,
         op_types=("MatMul", "Gather"),
         axes=(0, 1),
     ),
     "LLM_Vision": Plan(method=QUANT_METHOD, external=True, optimize=True),
     "LLM_Image_Preprocess": Plan(method="F32", optimize=False),
-    "LLM_KV_Slice": Plan(method="F32", optimize=False),
-    "LLM_KV_Split2": Plan(method="F32", optimize=False),
-    "LLM_KV_Concat": Plan(method="F32", optimize=False),
-    "LLM_RopeShift": Plan(method="F32", optimize=False),
 }
 
 CONFIG = OptimizerConfig(
@@ -87,7 +108,6 @@ CONFIG = OptimizerConfig(
     model_plans=MODEL_PLANS,
     quant_method=QUANT_METHOD,
     weight_only_algorithm=WEIGHT_ONLY_ALGORITHM,
-    kv_blocked_qdq_surgery=KV_BLOCKED_QDQ_SURGERY,
 )
 _common.configure_optimizer(CONFIG)
 
@@ -95,6 +115,51 @@ _common.configure_optimizer(CONFIG)
 def __getattr__(name: str):
     """Expose approved shared optimizer helpers without copying them locally."""
     return getattr(_common, name)
+
+
+def _copy_tokenizer_assets(output_folder: Path) -> list[str]:
+    missing = [
+        name for name in REQUIRED_TOKENIZER_ASSET_NAMES
+        if not (SOURCE_BUNDLE_DIR / name).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Exported OvisOCR2 tokenizer assets are missing from "
+            f"{SOURCE_BUNDLE_DIR}: {missing!r}."
+        )
+    output_folder.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for name in TOKENIZER_ASSET_NAMES:
+        source_path = SOURCE_BUNDLE_DIR / name
+        if source_path.is_file():
+            shutil.copy2(source_path, output_folder / name)
+            copied.append(name)
+    return copied
+
+
+def _copy_kv_helper_graphs(output_folder: Path) -> list[str]:
+    """Preserve standalone cache helpers that are not part of merged model plans."""
+    file_names = Shared_Merged.default_model_file_names()
+    helper_paths = {
+        role: SOURCE_BUNDLE_DIR / file_names[role]
+        for role in KV_HELPER_ROLES
+    }
+    present = [role for role, path in helper_paths.items() if path.is_file()]
+    if not present:
+        return []
+    missing = [file_names[role] for role, path in helper_paths.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Exported OvisOCR2 KV helper graphs are missing: {missing!r}."
+        )
+    copied = []
+    for role in KV_HELPER_ROLES:
+        filename = file_names[role]
+        destination = output_folder / filename
+        shutil.copy2(helper_paths[role], destination)
+        Shared_Merged.validate_onnx_path(destination)
+        copied.append(filename)
+    return copied
 
 
 def _restamp_shared_initializer_metadata(output_folder: Path) -> None:
@@ -131,25 +196,25 @@ def optimize_bundle(
     output_folder: Path | None = None,
 ) -> None:
     """Optimize the exported bundle and restore its runtime assets."""
-    print(f"Using shared optimizer: {COMMON_PATH}")
+    print(f"Using shared optimizer: {SHARED_OPTIMIZE_ONNX_COMMON}")
     quant_method = quant_method.upper()
     output_folder = (output_folder or _default_output_dir(quant_method)).resolve()
     if output_folder == SOURCE_BUNDLE_DIR.resolve():
-        raise ValueError("--output-folder must not overwrite SuryaOCR_ONNX.")
+        raise ValueError("--output-folder must not overwrite OvisOCR2_ONNX.")
     config = _common.make_affine_v2_variant_config(
         CONFIG, quant_method, output_folder
     )
     run_optimizer(config)
-    tokenizer_assets = copy_tokenizer_assets(
-        SOURCE_BUNDLE_DIR, output_folder
-    )
+    kv_helpers = _copy_kv_helper_graphs(output_folder)
+    tokenizer_assets = _copy_tokenizer_assets(output_folder)
     _restamp_shared_initializer_metadata(output_folder)
+    print(f"Copied {len(kv_helpers)} KV helper graphs to {output_folder}.")
     print(f"Copied {len(tokenizer_assets)} tokenizer assets to {output_folder}.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Optimize SuryaOCR with AFFINE_REFINE_V2 Q4 or Q8 weights."
+        description="Optimize OvisOCR2 with AFFINE_REFINE_V2 Q4 or Q8 weights."
     )
     parser.add_argument(
         "--quant-method", choices=_AFFINE_REFINE_V2_METHODS, default=QUANT_METHOD

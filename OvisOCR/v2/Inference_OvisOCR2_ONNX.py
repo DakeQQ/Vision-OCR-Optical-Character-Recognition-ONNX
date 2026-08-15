@@ -1,4 +1,4 @@
-"""Run SuryaOCR's standalone merged ONNX Runtime bundle."""
+"""Run OvisOCR2's standalone merged ONNX Runtime bundle."""
 
 from __future__ import annotations
 
@@ -17,19 +17,28 @@ from tokenizers import Tokenizer
 
 # Runtime paths and demo inputs
 SCRIPT_DIR           = Path(__file__).resolve().parent
-DEFAULT_MODEL_FOLDER = SCRIPT_DIR / "SuryaOCR_ONNX"
+DEFAULT_MODEL_FOLDER = SCRIPT_DIR / "OvisOCR2_Optimized"
 DEFAULT_IMAGE        = SCRIPT_DIR / "psyduck_2.png"
+DEFAULT_OCR_QUERY    = (
+    "Extract all readable content from the image in natural human reading order and "
+    "output the result as a single Markdown document. For charts or images, represent "
+    "them using an HTML image tag: <img src=\"images/bbox_{left}_{top}_{right}_{bottom}.jpg\" />, "
+    "where left, top, right, bottom are bounding box coordinates scaled to [0, 1000). "
+    "Format formulas as LaTeX. Format tables as HTML: <table>...</table>. Transcribe "
+    "all other text as standard Markdown. Preserve the original text without translation "
+    "or paraphrasing."
+)
 
 # Inference configuration
 INPUT_IMAGES           = [DEFAULT_IMAGE]
-QUERY                  = "OCR this image to HTML."
+QUERY                  = DEFAULT_OCR_QUERY
 STRATEGY               = "greedy"
 MAX_NEW_TOKENS         = None
 TEMPERATURE            = 0.8
 TOP_K                  = 20
 TOP_P                  = 0.95
 REPETITION_PENALTY     = 1.0
-PROVIDERS              = ("CPUExecutionProvider",)
+PROVIDERS              = []
 DEVICE_ID              = 0
 EXPECT_NONEMPTY_OUTPUT = False
 
@@ -39,6 +48,7 @@ CHAT_END_TOKEN     = "<|im_end|>"
 VISION_START_TOKEN = "<|vision_start|>"
 IMAGE_TOKEN        = "<|image_pad|>"
 VISION_END_TOKEN   = "<|vision_end|>"
+THINKING_PREFIX    = "<think>\n\n</think>\n\n"
 STRATEGIES         = ("greedy", "penalty_greedy", "sampling")
 
 # Graph compatibility constants
@@ -46,6 +56,10 @@ _DEFAULT_MODEL_FILE_NAMES = {
     "metadata": "LLM_Metadata.onnx",
     "image_preprocess": "LLM_Image_Preprocess.onnx",
     "vision": "LLM_Vision.onnx",
+    "kv_slice": "LLM_KV_Slice.onnx",
+    "kv_split2": "LLM_KV_Split2.onnx",
+    "kv_concat": "LLM_KV_Concat.onnx",
+    "rope_shift": "LLM_RopeShift.onnx",
     "shared_initializers": "LLM_SharedInitializers.onnx",
     "shared_initializers_data": "LLM_SharedInitializers.onnx.data",
     "image_prefill_greedy": "LLM_ImagePrefillGreedy.onnx",
@@ -54,10 +68,6 @@ _DEFAULT_MODEL_FILE_NAMES = {
     "image_decode_greedy": "LLM_ImageDecodeGreedy.onnx",
     "image_decode_penalty_greedy": "LLM_ImageDecodePenaltyGreedy.onnx",
     "image_decode_sampling": "LLM_ImageDecodeSampling.onnx",
-    "kv_slice": "LLM_KV_Slice.onnx",
-    "kv_split2": "LLM_KV_Split2.onnx",
-    "kv_concat": "LLM_KV_Concat.onnx",
-    "rope_shift": "LLM_RopeShift.onnx",
 }
 _UNSHAREABLE_INIT_TYPES = frozenset(
     getattr(TensorProto, name)
@@ -67,7 +77,7 @@ _UNSHAREABLE_INIT_TYPES = frozenset(
 
 
 def parse_args() -> Path:
-    parser = argparse.ArgumentParser(description="Run SuryaOCR merged ONNX inference.")
+    parser = argparse.ArgumentParser(description="Run OvisOCR2 merged ONNX inference.")
     parser.add_argument("--model-folder", type=Path, default=DEFAULT_MODEL_FOLDER)
     return parser.parse_args().model_folder
 
@@ -201,7 +211,7 @@ def create_merged_session(path: Path, shared_path: Path, providers: list[str]):
     options = create_session_options()
     references = attach_shared_initializers(options, shared_path)
     session = onnxruntime.InferenceSession(str(path), sess_options=options, providers=providers)
-    session._surya_shared_initializers = references
+    session._ovis_shared_initializers = references
     return session
 
 
@@ -262,9 +272,9 @@ def plan_merged_io(session, strategy: str, state_count: int, is_decode: bool) ->
     inputs = [item.name for item in session.get_inputs()]
     outputs = [item.name for item in session.get_outputs()]
     if inputs[:state_count] != [name for name in inputs[:state_count] if name.startswith("in_")]:
-        raise RuntimeError("Merged SuryaOCR state inputs must lead and be named in_*.")
+        raise RuntimeError("Merged OvisOCR2 state inputs must lead and be named in_*.")
     if outputs[:state_count] != [name for name in outputs[:state_count] if name.startswith("out_")]:
-        raise RuntimeError("Merged SuryaOCR state outputs must lead and be named out_*.")
+        raise RuntimeError("Merged OvisOCR2 state outputs must lead and be named out_*.")
     expected_tail = 2 if strategy == "greedy" else 3
     if len(outputs) != state_count + expected_tail:
         raise RuntimeError(f"Unexpected {strategy} output contract: {outputs!r}.")
@@ -315,26 +325,26 @@ def _parse_spans(metadata: dict[str, str]) -> list[tuple[int, int]]:
     return spans
 
 
-def build_surya_prompt(
+def build_ovis_prompt(
     tokenizer: Tokenizer, query: str, image_count: int, metadata: dict[str, str]
 ) -> tuple[np.ndarray, np.ndarray]:
     image_token_id = int(metadata["image_token_id"])
     image_token_length = int(metadata["image_token_length"])
     if image_count < 1:
-        raise ValueError("SuryaOCR requires at least one input image.")
+        raise ValueError("OvisOCR2 requires at least one input image.")
     if tokenizer.token_to_id(IMAGE_TOKEN) != image_token_id:
         raise RuntimeError("Bundle tokenizer image token does not match LLM_Metadata.onnx.")
     image_placeholder = f"{VISION_START_TOKEN}{IMAGE_TOKEN}{VISION_END_TOKEN}"
     prompt = (
         f"{CHAT_START_TOKEN}user\n{image_placeholder * image_count}{query}{CHAT_END_TOKEN}\n"
-        f"{CHAT_START_TOKEN}assistant\n"
+        f"{CHAT_START_TOKEN}assistant\n{THINKING_PREFIX}"
     )
     expanded = prompt.replace(IMAGE_TOKEN, IMAGE_TOKEN * image_token_length)
     token_ids = [int(value) for value in tokenizer.encode(expanded, add_special_tokens=False).ids]
     positions = [index for index, value in enumerate(token_ids) if value == image_token_id]
     expected = image_count * image_token_length
     if len(positions) != expected:
-        raise RuntimeError("Expanded SuryaOCR image token count differs from metadata.")
+        raise RuntimeError("Expanded OvisOCR2 image token count differs from metadata.")
     expected_spans = _parse_spans(metadata)
     spans = []
     cursor = 0
@@ -350,10 +360,10 @@ def build_surya_prompt(
         raise RuntimeError(
             f"Native chat template image spans {spans!r} differ from export metadata {expected_spans!r}."
         )
-    return np.asarray([token_ids], dtype=np.int32), build_surya_position_ids(token_ids, spans, metadata)
+    return np.asarray([token_ids], dtype=np.int32), build_ovis_position_ids(token_ids, spans, metadata)
 
 
-def build_surya_position_ids(
+def build_ovis_position_ids(
     token_ids: list[int], spans: list[tuple[int, int]], metadata: dict[str, str]
 ) -> np.ndarray:
     grid_height = int(metadata["image_grid_height"])
@@ -368,7 +378,7 @@ def build_surya_position_ids(
             current += 1
             cursor += 1
         if image_end - image_start != expected_length or expected_length != grid_height * grid_width:
-            raise RuntimeError("SuryaOCR image span does not match exported post-merge vision grid.")
+            raise RuntimeError("OvisOCR2 image span does not match exported post-merge vision grid.")
         positions[0, image_start:image_end] = current
         positions[1, image_start:image_end] = (
             np.repeat(np.arange(grid_height, dtype=np.int64), grid_width) + current
@@ -395,13 +405,21 @@ def load_images(paths: list[Path], height: int, width: int, batch_size: int, inp
             raise FileNotFoundError(path)
         with Image.open(path) as image:
             image = image.convert("RGB")
-            if image.size != (width, height):
-                image = image.resize((width, height), resampling)
-            images[index] = np.asarray(image, dtype=np.uint8).transpose(2, 0, 1)
+            source_width, source_height = image.size
+            scale = min(width / max(source_width, 1), height / max(source_height, 1))
+            resized_width = max(1, min(width, int(round(source_width * scale))))
+            resized_height = max(1, min(height, int(round(source_height * scale))))
+            if image.size != (resized_width, resized_height):
+                image = image.resize((resized_width, resized_height), resampling)
+            canvas = Image.new("RGB", (width, height), (128, 128, 128))
+            offset_x = (width - resized_width) // 2
+            offset_y = (height - resized_height) // 2
+            canvas.paste(image, (offset_x, offset_y))
+            images[index] = np.asarray(canvas, dtype=np.uint8).transpose(2, 0, 1)
     if input_rank == 5:
         images = np.expand_dims(images, axis=1)
     elif input_rank != 4:
-        raise ValueError(f"Unsupported SuryaOCR image input rank: {input_rank}.")
+        raise ValueError(f"Unsupported OvisOCR2 image input rank: {input_rank}.")
     return np.ascontiguousarray(images)
 
 
@@ -431,7 +449,7 @@ def run_vision(preprocess_session, vision_session, images, device_type, ort_devi
     output_names = [item.name for item in vision_session.get_outputs()]
     _bind_outputs(vision_binding, output_names, ort_device)
     _run(vision_session, vision_binding)
-    vision_session._surya_runtime_values = retained
+    vision_session._ovis_runtime_values = retained
     return dict(zip(output_names, vision_binding.get_outputs()))
 
 
@@ -472,7 +490,7 @@ def assert_bundle(bundle: Path, file_names: dict[str, str]):
             required.append(file_names[f"image_{phase}_{strategy}"])
     missing = [name for name in required if not (bundle / name).is_file()]
     if missing:
-        raise FileNotFoundError(f"Merged SuryaOCR bundle is incomplete: {missing!r}.")
+        raise FileNotFoundError(f"Merged OvisOCR2 bundle is incomplete: {missing!r}.")
 
 
 def run_generation(model_folder, metadata, file_names, tokenizer, vision_outputs, device_type, ort_device, providers):
@@ -491,7 +509,7 @@ def run_generation(model_folder, metadata, file_names, tokenizer, vision_outputs
     prefill_meta = _input_meta(prefill)
     decode_meta = _input_meta(decode)
 
-    token_ids, prefill_positions = build_surya_prompt(
+    token_ids, prefill_positions = build_ovis_prompt(
         tokenizer, QUERY, int(metadata["vision_batch_size"]), metadata
     )
     prefill_length = token_ids.shape[1]
@@ -594,7 +612,7 @@ def run_generation(model_folder, metadata, file_names, tokenizer, vision_outputs
 
 
 def run_inference(model_folder: Path) -> None:
-    """Run one SuryaOCR request from the selected ONNX bundle."""
+    """Run one OvisOCR request from the selected ONNX bundle."""
     model_folder = model_folder.expanduser().resolve()
     if STRATEGY not in STRATEGIES:
         raise ValueError(f"Unsupported STRATEGY: {STRATEGY!r}.")

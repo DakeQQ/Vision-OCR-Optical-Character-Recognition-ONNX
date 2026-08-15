@@ -1,49 +1,33 @@
-"""Optimize FireRedOCR's ONNX bundle through the shared OCR optimizer."""
+"""Optimize LFM2.5-VL-450M-Extract through the repository shared optimizer."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
-import shutil
+import os
 import sys
 from pathlib import Path
 
+import Shared_Merged
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parents[2]
+SHARED_OPTIMIZE_ONNX_COMMON = REPO_ROOT / "Optimize_ONNX_Common.py"
+os.environ.setdefault("NUMBA_CACHE_DIR", str(SCRIPT_DIR / ".numba_cache"))
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from OCR_Tokenizer_Assets import copy_tokenizer_assets
 
 
-def _load_local_shared_merged():
-    module_path = SCRIPT_DIR / "Shared_Merged.py"
-    spec = importlib.util.spec_from_file_location(
-        "_fireredocr_shared_merged", module_path
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load local merge helper: {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(spec.name, None)
-        raise
-    return module
-
-
-Shared_Merged = _load_local_shared_merged()
-
-
 def _load_shared_optimizer():
-    module_path = REPO_ROOT / "Optimize_ONNX_Common.py"
     spec = importlib.util.spec_from_file_location(
-        "_fireredocr_optimizer_common", module_path
+        "_lfm25_vl_optimizer_common", SHARED_OPTIMIZE_ONNX_COMMON
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load shared optimizer: {module_path}")
+        raise RuntimeError(f"Cannot load shared optimizer: {SHARED_OPTIMIZE_ONNX_COMMON}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     try:
@@ -59,35 +43,33 @@ OptimizerConfig = _common.OptimizerConfig
 Plan = _common.Plan
 run_optimizer = _common.run_optimizer
 
-
 # Bundle paths
-SOURCE_BUNDLE_DIR    = str(SCRIPT_DIR / "FireRedOCR_ONNX")
-OPTIMIZED_BUNDLE_DIR = str(SCRIPT_DIR / "FireRedOCR_Optimized")
-CHECKPOINT_DIR       = str(Path.home() / "Downloads" / "FireRed-OCR")
+SOURCE_BUNDLE_DIR    = SCRIPT_DIR / "LFM25_VL_ONNX"
+OPTIMIZED_BUNDLE_DIR = SCRIPT_DIR / "LFM25_VL_Optimized"
+CHECKPOINT_DIR       = Path.home() / "Downloads" / "LFM2.5-VL-450M-Extract"
 ORIGINAL_FOLDER_PATH = SOURCE_BUNDLE_DIR
 QUANTED_FOLDER_PATH  = OPTIMIZED_BUNDLE_DIR
-DOWNLOAD_PATH        = CHECKPOINT_DIR
+MODEL_FOLDER         = CHECKPOINT_DIR
 
 # Quantization policy
 QUANT_METHOD          = "Q4"
 WEIGHT_ONLY_ALGORITHM = "AFFINE_REFINE_V2"
 _AFFINE_REFINE_V2_METHODS = ("Q4", "Q8")
-KV_HELPER_FILE_NAMES = (
-    "LLM_KV_Slice.onnx",
-    "LLM_KV_Split2.onnx",
-    "LLM_KV_Concat.onnx",
-    "LLM_RopeShift.onnx",
-)
 
 # Per-graph optimization plans
-_PRIMARY_MERGED_MODEL = Path(
-    Shared_Merged.default_model_file_names()["image_prefill_greedy"]
-).stem
+PRIMARY_MERGED_MODEL = Path(Shared_Merged.default_model_file_names()["image_prefill_greedy"]).stem
 MODEL_PLANS: dict[str, Plan] = {
     "LLM_Metadata": Plan(method="F32", optimize=False),
-    _PRIMARY_MERGED_MODEL: Plan(method=QUANT_METHOD, external=True, optimize=True),
-    "LLM_Vision": Plan(method=QUANT_METHOD, external=True),
     "LLM_Image_Preprocess": Plan(method="F32", optimize=False),
+    "LLM_Vision": Plan(method=QUANT_METHOD, op_types=("MatMul",), axes=(0,), external=True, optimize=True),
+    PRIMARY_MERGED_MODEL: Plan(
+        method=QUANT_METHOD,
+        op_types=("MatMul", "Gather"),
+        axes=(0, 1),
+        external=True,
+        optimize=True,
+        kv_surgery=False,
+    ),
 }
 
 CONFIG = OptimizerConfig(
@@ -103,29 +85,15 @@ _common.configure_optimizer(CONFIG)
 
 
 def __getattr__(name: str):
-    """Preserve direct access to shared helper functions from this legacy path."""
+    """Expose approved shared helpers without copying their implementation."""
     return getattr(_common, name)
 
 
-def _copy_kv_helpers(target_folder: Path) -> None:
-    source_folder = Path(SOURCE_BUNDLE_DIR)
-    for file_name in KV_HELPER_FILE_NAMES:
-        source = source_folder / file_name
-        target = target_folder / file_name
-        target.unlink(missing_ok=True)
-        target.with_name(target.name + ".data").unlink(missing_ok=True)
-        if not source.exists():
-            continue
-        shutil.copy2(source, target)
-        source_data = source.with_name(source.name + ".data")
-        if source_data.exists():
-            shutil.copy2(source_data, target.with_name(target.name + ".data"))
-
-
 def _default_output_dir(quant_method: str) -> Path:
-    output = Path(OPTIMIZED_BUNDLE_DIR)
-    return output if quant_method == QUANT_METHOD else output.with_name(
-        f"{output.name}_{quant_method}"
+    return (
+        OPTIMIZED_BUNDLE_DIR
+        if quant_method == QUANT_METHOD
+        else OPTIMIZED_BUNDLE_DIR.with_name(f"{OPTIMIZED_BUNDLE_DIR.name}_{quant_method}")
     )
 
 
@@ -134,15 +102,15 @@ def optimize_bundle(
     output_folder: Path | None = None,
 ) -> None:
     """Optimize the exported bundle and restore its runtime assets."""
+    print(f"Using shared optimizer: {SHARED_OPTIMIZE_ONNX_COMMON}")
     quant_method = quant_method.upper()
     output_folder = (output_folder or _default_output_dir(quant_method)).resolve()
-    if output_folder == Path(SOURCE_BUNDLE_DIR).resolve():
-        raise ValueError("--output-folder must not overwrite FireRedOCR_ONNX.")
+    if output_folder == SOURCE_BUNDLE_DIR.resolve():
+        raise ValueError("--output-folder must not overwrite LFM25_VL_ONNX.")
     config = _common.make_affine_v2_variant_config(
         CONFIG, quant_method, output_folder
     )
     run_optimizer(config)
-    _copy_kv_helpers(output_folder)
     tokenizer_assets = copy_tokenizer_assets(
         SOURCE_BUNDLE_DIR, output_folder
     )
@@ -151,7 +119,7 @@ def optimize_bundle(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Optimize FireRedOCR with AFFINE_REFINE_V2 Q4 or Q8 weights."
+        description="Optimize LFM2.5-VL Extract with AFFINE_REFINE_V2 Q4 or Q8 weights."
     )
     parser.add_argument(
         "--quant-method", choices=_AFFINE_REFINE_V2_METHODS, default=QUANT_METHOD

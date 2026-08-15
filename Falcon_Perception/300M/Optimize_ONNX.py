@@ -1,391 +1,288 @@
-import os
-import gc
-import glob
-import onnx
-import onnx.version_converter
+"""Optimize Falcon Perception's merged OCR bundle through the shared optimizer."""
+
+from __future__ import annotations
+
+import argparse
+import sys
 from pathlib import Path
-from onnxslim import slim
-from onnxruntime.transformers.optimizer import optimize_model
-from onnxruntime.quantization import (
-    matmul_nbits_quantizer,  # onnxruntime >= 1.22.0
-    quant_utils
-)
+
+import onnx
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from OCR_Tokenizer_Assets import copy_tokenizer_assets
+from Optimize_ONNX_Common import OptimizerConfig, Plan, run_optimizer
+import Shared_Merged
 
 
-# ==============================================================================
-# Path Settings
-# ==============================================================================
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-original_folder_path = os.path.join(SCRIPT_DIR, 'Falcon_Perception_ONNX')
-quanted_folder_path = os.path.join(SCRIPT_DIR, 'Falcon_Perception_Optimized')
-os.makedirs(quanted_folder_path, exist_ok=True)
+# Bundle paths
+SOURCE_BUNDLE_DIR     = SCRIPT_DIR / "Falcon_Perception_ONNX"
+OPTIMIZED_BUNDLE_DIR  = SCRIPT_DIR / "Falcon_Perception_Optimized"
+CHECKPOINT_DIR        = Path.home() / "Downloads" / "Falcon-Perception-300M"
+ORIGINAL_FOLDER_PATH  = SOURCE_BUNDLE_DIR
+QUANTIZED_FOLDER_PATH = OPTIMIZED_BUNDLE_DIR
+DOWNLOAD_PATH         = CHECKPOINT_DIR
+
+# Quantization policy
+QUANT_METHOD          = "Q8"                # Q2 | Q4 | Q8 | DYNAMIC | F16 | F32 (optimize-only).
+WEIGHT_ONLY_ALGORITHM = "AFFINE_REFINE_V2"  # AFFINE_REFINE_V2 | DEFAULT | RTN | HQQ | k_quant (Q4-only).
+_AFFINE_REFINE_V2_METHODS = ("Q4", "Q8")
+_AFFINE_REFINE_V2_OPS = ("MatMul", "Gather")
+_AFFINE_REFINE_V2_AXES = (0, 1)
+
+# Per-graph optimization plans
+_PRIMARY_MERGED_MODEL = Path(
+    Shared_Merged.default_model_file_names()["image_prefill_greedy"]
+).stem
+def _model_plans(quant_method: str, embedding_only: bool) -> dict[str, Plan]:
+    op_types = ("Gather",) if embedding_only else _AFFINE_REFINE_V2_OPS
+    axes = (1,) if embedding_only else _AFFINE_REFINE_V2_AXES
+    peripheral_method = "F32" if embedding_only else quant_method
+    return {
+        "LLM_Metadata": Plan(method="F32", optimize=False),
+        # Falcon's untied token embedding is detector-sensitive. Quantize its base
+        # table, then add a compact residual to preserve detector tokens. Q8 stores
+        # that correction as a second Q8 lookup instead of a full F16 table.
+        _PRIMARY_MERGED_MODEL: Plan(
+            method=quant_method,
+            op_types=op_types,
+            axes=axes,
+            external=True,
+            optimize=True,
+            quantize_embedding=True,
+            embedding_residual_dtype="F16",
+            compact_embedding_residual=quant_method == "Q8",
+        ),
+        "LLM_Vision": Plan(method=peripheral_method, external=True, optimize=False),
+        "LLM_Image_Preprocess": Plan(method="F32", optimize=False),
+        "LLM_FalconCoordinateFeedback": Plan(method=peripheral_method, optimize=False),
+        "LLM_FalconSizeFeedback": Plan(method=peripheral_method, optimize=False),
+    }
 
 
-# ==============================================================================
-# Lazy Settings (set one True for auto-select, or both False for manual)
-# ==============================================================================
-lazy_setting_CPU = True                  # Set True to auto-select CPU settings.
-lazy_setting_GPU = False                 # Set True to auto-select GPU settings.
-use_openvino     = False                 # Set True for OpenVINO optimization.
-SAVE_TWO_PARTS   = False                 # If True, save the model into 2 parts.
-upgrade_opset    = 0                     # Optional opset upgrade. Set 0 to disable.
-
-
-# ==============================================================================
-# Model List (matches the exported Falcon Perception module set)
-# ==============================================================================
-model_names = [                          # Recommended dtype:
-    "LLM_Embed",                         # [int4, float32, float16]
-    "LLM_Vision",                        # [int8, float32, float16]
-    "LLM_Main",                          # [int8, int4, float32, float16]
-    "Prefill_Mask",                      # [float32, float16]
-    "Coord_Encoder",                     # [float32, float16]
-    "Size_Encoder",                      # [float32, float16]
-    "Greedy_Search",                     # [float32, float16]
-    "First_Beam_Search",                 # [float32, float16]
-    "Second_Beam_Search",                # [float32, float16]
-    "Apply_Penalty",                     # [float32, float16]
-    "Argmax",                            # [float32, float16]
-    "KV_Slice",                          # [float32, float16]
-]
-
-
-# ==============================================================================
-# Manual Quantization Settings
-# ==============================================================================
-quant_int4       = False                 # Quant to int4 (not used by auto settings).
-quant_int8       = False                 # Global default, overridden per model.
-quant_float16    = False                 # Global default, overridden per model.
-keep_io_dtype    = True                  # Must be True for mixed-precision.
-fp16_op_block_list = [
-    'DynamicQuantizeLinear',
-    'DequantizeLinear',
-    'DynamicQuantizeMatMul',
-    'Range',
-    'MatMulIntegerToFloat',
-    # 'Resize',
-    # 'Pow',
-    # 'ReduceSum',
-    # 'ReduceMean',
-    # 'Sqrt'
-]
-
-
-# ==============================================================================
-# Int4 matmul_nbits_quantizer Settings
-# ==============================================================================
-algorithm        = "k_quant"             # ["DEFAULT", "RTN", "HQQ", "k_quant"]
-bits             = 4                     # [4, 8]; 8 is not recommended.
-block_size       = 16                    # [16, 32, 64, 128, 256]; smaller => more accuracy.
-accuracy_level   = 4                     # 0:default, 1:fp32, 2:fp16, 3:bf16, 4:int8
-quant_symmetric  = False                 # False may yield more accuracy.
-nodes_to_exclude = None                  # Example: ["/layers.0/mlp/down_proj/MatMul"]
-
-
-# ==============================================================================
-# Per-Model Target Dtype Mapping (CPU)
-# ==============================================================================
-CPU_MODEL_DTYPE = {
-    "LLM_Embed":          "int4",
-    "LLM_Vision":         "int8",
-    "LLM_Main":           "int8",
-    "Prefill_Mask":       "float32",
-    "Coord_Encoder":      "float32",
-    "Size_Encoder":       "float32",
-    "Greedy_Search":      "float32",
-    "First_Beam_Search":  "float32",
-    "Second_Beam_Search": "float32",
-    "Apply_Penalty":      "float32",
-    "Argmax":             "float32",
-    "KV_Slice":           "float32",
-}
-
-
-# ==============================================================================
-# Per-Model Target Dtype Mapping (GPU)
-# ==============================================================================
-GPU_MODEL_DTYPE = {
-    "LLM_Embed":          "float16",
-    "LLM_Vision":         "float16",
-    "LLM_Main":           "float16",
-    "Prefill_Mask":       "float16",
-    "Coord_Encoder":      "float16",
-    "Size_Encoder":       "float16",
-    "Greedy_Search":      "float16",
-    "First_Beam_Search":  "float16",
-    "Second_Beam_Search": "float16",
-    "Apply_Penalty":      "float16",
-    "Argmax":             "float16",
-    "KV_Slice":           "float16",
-}
-
-# Validate lazy settings
-if lazy_setting_CPU and lazy_setting_GPU:
-    raise ValueError("Only one of lazy_setting_CPU or lazy_setting_GPU can be True.")
-
-
-# ==============================================================================
-# Helper Functions
-# ==============================================================================
-def _is_transformer_block(name):
-    # Modules whose large weight MatMuls benefit from int8 weight-only quantization.
-    # LLM_Vision is included for its img_projector MatMul, but it is NOT given
-    # bert-style attention optimizer hints (see _num_heads / _hidden_size below),
-    # because it is a patchify + linear-projection graph, not a self-attention stack.
-    return name in ("LLM_Main", "LLM_Vision")
-
-
-def _is_embed_block(name):
-    return name == "LLM_Embed"
-
-
-def _opt_level(name):
-    return 1 if use_openvino else 2
-
-
-def _num_heads(name):
-    # Only LLM_Main is a real attention stack; LLM_Vision has no bert-style attention.
-    if name == "LLM_Main":
-        return 16
-    return 0
-
-
-def _hidden_size(name):
-    # Falcon Perception 300M model dim is 768.
-    if name == "LLM_Main":
-        return 768
-    return 0
-
-
-def _safe_optimize_model(model_path, model_name):
-    """Run the ORT transformers optimizer, falling back gracefully if a fusion
-    pass raises. Some ORT versions crash inside fuse_simplified_layer_norm on
-    Falcon's explicit RMSNorm pattern; in that case the (already correctly
-    quantized) model is returned unchanged so the pipeline still completes."""
-    try:
-        return optimize_model(
-            model_path, use_gpu=False, opt_level=_opt_level(model_name),
-            num_heads=_num_heads(model_name), hidden_size=_hidden_size(model_name),
-            verbose=False, model_type='bert', only_onnxruntime=use_openvino,
+def _build_config(
+    quant_method: str = QUANT_METHOD,
+    optimized_bundle_dir: Path = OPTIMIZED_BUNDLE_DIR,
+    embedding_only: bool = False,
+) -> OptimizerConfig:
+    quant_method = quant_method.upper()
+    if quant_method not in _AFFINE_REFINE_V2_METHODS:
+        raise ValueError(
+            f"AFFINE_REFINE_V2 quantization requires one of {_AFFINE_REFINE_V2_METHODS}, got {quant_method!r}."
         )
-    except Exception as e:
-        print(f"[Warning] ORT optimizer pass failed for {model_name} ({e}); keeping the unfused model.")
-        from onnxruntime.transformers.onnx_model import OnnxModel
-        return OnnxModel(onnx.load(model_path))
+    return OptimizerConfig(
+        original_folder_path=str(SOURCE_BUNDLE_DIR),
+        quantized_folder_path=str(optimized_bundle_dir),
+        download_path=str(CHECKPOINT_DIR),
+        shared_merged=Shared_Merged,
+        model_plans=_model_plans(quant_method, embedding_only),
+        quant_method=quant_method,
+        weight_only_algorithm=WEIGHT_ONLY_ALGORITHM,
+    )
 
 
-# ==============================================================================
-# Core Processing Function
-# ==============================================================================
-def process_single_model(
-    model_path,
-    quanted_model_path,
-    model_name,
-    bits,
-    block_size,
-    quant_int4_flag,
-    quant_int8_flag,
-    quant_float16_flag,
-    keep_io_flag,
-    op_block_list,
-):
-    """Process a single ONNX file: quantize / optimize / slim."""
-    be_optimized = False
+MODEL_PLANS = _model_plans(QUANT_METHOD, embedding_only=False)
+CONFIG = _build_config()
 
-    if lazy_setting_CPU or lazy_setting_GPU:
-        if quant_int4_flag:
-            bits = 4
-            block_size = 16
-        elif quant_int8_flag:
-            bits = 8
-            block_size = 32
 
-    # ------------------------------------------------------------------
-    # Branch 1: Integer quantization (int4 / int8)
-    # ------------------------------------------------------------------
-    if (quant_int4_flag or quant_int8_flag) and (_is_embed_block(model_name) or _is_transformer_block(model_name)):
-        if _is_embed_block(model_name):
-            op_types = ["Gather"]
-            quant_axes = [1]
-            algo = "DEFAULT"
-        else:
-            op_types = ["MatMul"]
-            quant_axes = [0]
-            if quant_int8_flag:
-                algo = "DEFAULT"
+def _restamp_bundle_metadata(optimized_bundle_dir: Path) -> None:
+    """Preserve the exporter metadata when the shared carrier is regenerated."""
+    source = SOURCE_BUNDLE_DIR / Shared_Merged.default_model_file_names()["metadata"]
+    metadata_model = onnx.load(str(source), load_external_data=False)
+    metadata = {item.key: item.value for item in metadata_model.metadata_props}
+    for path in optimized_bundle_dir.glob("*.onnx"):
+        model = onnx.load(str(path), load_external_data=False)
+        values = {item.key: item.value for item in model.metadata_props}
+        values.update(metadata)
+        model.ClearField("metadata_props")
+        for key in sorted(values):
+            model.metadata_props.add(key=key, value=values[key])
+        onnx.save_model(model, str(path))
+
+
+def _node_bits(node: onnx.NodeProto) -> int | None:
+    for attribute in node.attribute:
+        if attribute.name == "bits":
+            return int(attribute.i)
+    return None
+
+
+_FLOAT_MATRIX_TYPES = frozenset({
+    onnx.TensorProto.FLOAT,
+    onnx.TensorProto.FLOAT16,
+    onnx.TensorProto.DOUBLE,
+    onnx.TensorProto.BFLOAT16,
+})
+
+
+def _validate_weight_only_matrix_coverage(
+    path: Path,
+    model: onnx.ModelProto,
+    expected_bits: int,
+) -> None:
+    """Reject retained constant float matrix weights in a Q8 model."""
+    initializers = {initializer.name: initializer for initializer in model.graph.initializer}
+    float_matrix_weights = []
+    for node in model.graph.node:
+        if node.op_type not in ("MatMul", "Gemm") or len(node.input) < 2:
+            continue
+        weight = initializers.get(node.input[1])
+        if (
+            weight is not None
+            and len(weight.dims) == 2
+            and weight.data_type in _FLOAT_MATRIX_TYPES
+        ):
+            float_matrix_weights.append(
+                f"{node.name or node.op_type} <- {weight.name}{tuple(weight.dims)}"
+            )
+    if float_matrix_weights:
+        raise RuntimeError(
+            f"{path.name} retained float constant matrix weight(s): "
+            + "; ".join(float_matrix_weights)
+        )
+
+    matmul_bits = {
+        _node_bits(node)
+        for node in model.graph.node
+        if node.op_type == "MatMulNBits"
+    }
+    if not matmul_bits or matmul_bits != {expected_bits}:
+        raise RuntimeError(
+            f"{path.name} contains MatMulNBits widths {sorted(matmul_bits)}; "
+            f"expected only Q{expected_bits}."
+        )
+
+
+def _validate_affine_refine_v2_bundle(
+    optimized_bundle_dir: Path,
+    quant_method: str,
+    embedding_only: bool,
+) -> None:
+    expected_bits = int(quant_method[1:])
+    compact_residual = _model_plans(
+        quant_method, embedding_only
+    )[_PRIMARY_MERGED_MODEL].compact_embedding_residual
+    file_names = Shared_Merged.default_model_file_names()
+    for phase in ("prefill", "decode"):
+        for strategy in ("greedy", "penalty_greedy", "sampling"):
+            path = optimized_bundle_dir / file_names[f"image_{phase}_{strategy}"]
+            model = onnx.load(str(path), load_external_data=False)
+            producers = {
+                output: node
+                for node in model.graph.node
+                for output in node.output
+                if output
+            }
+            quantized_outputs = {
+                output
+                for node in model.graph.node
+                if node.op_type == "GatherBlockQuantized"
+                and _node_bits(node) == expected_bits
+                for output in node.output
+                if output
+            }
+            if compact_residual:
+                has_residual_add = any(
+                    node.op_type == "Add"
+                    and sum(input_name in quantized_outputs for input_name in node.input) >= 2
+                    for node in model.graph.node
+                )
             else:
-                algo = algorithm_copy
+                has_residual_add = any(
+                    node.op_type == "Add"
+                    and any(input_name in quantized_outputs for input_name in node.input)
+                    and any(
+                        producers.get(input_name, onnx.NodeProto()).op_type in ("Gather", "Cast")
+                        for input_name in node.input
+                        if input_name not in quantized_outputs
+                    )
+                    for node in model.graph.node
+                )
+            if not quantized_outputs or not has_residual_add:
+                raise RuntimeError(
+                    f"{path.name} is missing a Q{expected_bits} embedding residual correction."
+                )
+            if compact_residual:
+                residual_gathers = [
+                    node
+                    for node in model.graph.node
+                    if node.op_type == "GatherBlockQuantized"
+                    and "residual" in node.name.lower()
+                ]
+                if len(residual_gathers) != 1:
+                    raise RuntimeError(
+                        f"{path.name} is missing its compact Q8 embedding residual lookup."
+                    )
+            if not embedding_only:
+                _validate_weight_only_matrix_coverage(path, model, expected_bits)
 
-        model = quant_utils.load_model_with_shape_infer(Path(model_path))
-        axes_tuple = tuple((op_types[i], quant_axes[i]) for i in range(len(op_types)))
+    if not embedding_only:
+        for model_name in (
+            "LLM_Vision.onnx",
+            "LLM_FalconCoordinateFeedback.onnx",
+            "LLM_FalconSizeFeedback.onnx",
+        ):
+            path = optimized_bundle_dir / model_name
+            model = onnx.load(str(path), load_external_data=False)
+            _validate_weight_only_matrix_coverage(path, model, expected_bits)
 
-        if algo == "RTN":
-            quant_config = matmul_nbits_quantizer.RTNWeightOnlyQuantConfig(
-                quant_format=quant_utils.QuantFormat.QOperator,
-                op_types_to_quantize=tuple(op_types),
-            )
-        elif algo == "HQQ":
-            quant_config = matmul_nbits_quantizer.HQQWeightOnlyQuantConfig(
-                bits=bits,
-                block_size=block_size,
-                axis=quant_axes[0],
-                quant_format=quant_utils.QuantFormat.QOperator,
-                op_types_to_quantize=tuple(op_types),
-                quant_axes=axes_tuple,
-            )
-        elif algo == "k_quant":
-            quant_config = matmul_nbits_quantizer.KQuantWeightOnlyQuantConfig(
-                quant_format=quant_utils.QuantFormat.QOperator,
-                op_types_to_quantize=tuple(op_types),
-            )
-        else:
-            quant_config = matmul_nbits_quantizer.DefaultWeightOnlyQuantConfig(
-                block_size=block_size,
-                is_symmetric=quant_symmetric,
-                accuracy_level=accuracy_level,
-                quant_format=quant_utils.QuantFormat.QOperator,
-                op_types_to_quantize=tuple(op_types),
-                quant_axes=axes_tuple,
-            )
 
-        quant_config.bits = bits
-        quant = matmul_nbits_quantizer.MatMulNBitsQuantizer(
-            model,
-            block_size=block_size,
-            is_symmetric=quant_symmetric,
-            accuracy_level=accuracy_level,
-            quant_format=quant_utils.QuantFormat.QOperator,
-            op_types_to_quantize=tuple(op_types),
-            quant_axes=axes_tuple,
-            algo_config=quant_config,
-            nodes_to_exclude=nodes_to_exclude,
-        )
-        quant.process()
-        quant.model.save_model_to_file(quanted_model_path, True)
+def _default_output_dir(quant_method: str, embedding_only: bool) -> Path:
+    if quant_method == QUANT_METHOD and not embedding_only:
+        return OPTIMIZED_BUNDLE_DIR
+    suffix = f"_{quant_method}" + ("_Embed" if embedding_only else "")
+    return SCRIPT_DIR / f"Falcon_Perception_Optimized{suffix}"
 
-    # ------------------------------------------------------------------
-    # Branch 2: Float16 conversion
-    # ------------------------------------------------------------------
-    elif quant_float16_flag:
-        print("Optimizing model before Float16 conversion...")
-        be_optimized = True
-        model = _safe_optimize_model(model_path, model_name)
-        print("Converting model to Float16...")
-        model.convert_float_to_float16(
-            keep_io_types=keep_io_flag,
-            force_fp16_initializers=True,
-            use_symbolic_shape_infer=False if "LLM_Main" in model_name else True,
-            max_finite_val=32767.0,
-            op_block_list=op_block_list,
-        )
-        model.save_model_to_file(quanted_model_path, use_external_data_format=SAVE_TWO_PARTS)
 
-    # ------------------------------------------------------------------
-    # Branch 3: Float32 (optimize only, no quantization)
-    # ------------------------------------------------------------------
-    else:
-        print("Target dtype is float32: optimizing without quantization...")
-        be_optimized = True
-        model = _safe_optimize_model(model_path, model_name)
-        model.save_model_to_file(quanted_model_path, use_external_data_format=SAVE_TWO_PARTS)
-
-    # ------------------------------------------------------------------
-    # Post-quantization optimization pass
-    # ------------------------------------------------------------------
-    if not be_optimized:
-        print("Running additional ONNX Runtime optimization on quantized model...")
-        model = _safe_optimize_model(quanted_model_path, model_name)
-        model.save_model_to_file(quanted_model_path, use_external_data_format=SAVE_TWO_PARTS)
-
-    # ------------------------------------------------------------------
-    # Slim pass
-    # ------------------------------------------------------------------
-    slim(
-        model=quanted_model_path,
-        output_model=quanted_model_path,
-        no_shape_infer=True if "LLM_Main" in model_name else False,
-        skip_fusion_patterns=False,
-        no_constant_folding=False,
-        save_as_external_data=SAVE_TWO_PARTS,
-        verbose=False,
+def optimize_bundle(
+    quant_method: str = QUANT_METHOD,
+    optimized_bundle_dir: Path = OPTIMIZED_BUNDLE_DIR,
+    embedding_only: bool = False,
+) -> None:
+    """Optimize the exported bundle and restore its runtime assets."""
+    quant_method = quant_method.upper()
+    optimized_bundle_dir = optimized_bundle_dir.expanduser().resolve()
+    run_optimizer(_build_config(quant_method, optimized_bundle_dir, embedding_only))
+    _validate_affine_refine_v2_bundle(
+        optimized_bundle_dir, quant_method, embedding_only
     )
-
-    # ------------------------------------------------------------------
-    # Optional opset upgrade
-    # ------------------------------------------------------------------
-    if upgrade_opset > 0:
-        print(f"Upgrading Opset to {upgrade_opset}...")
-        try:
-            m = onnx.load(quanted_model_path)
-            converted_model = onnx.version_converter.convert_version(m, upgrade_opset)
-            onnx.save(converted_model, quanted_model_path, save_as_external_data=SAVE_TWO_PARTS)
-            del m, converted_model
-            gc.collect()
-        except Exception as e:
-            print(f"Could not upgrade opset due to an error: {e}. Saving model with original opset.")
-            m = onnx.load(quanted_model_path)
-            onnx.save(m, quanted_model_path, save_as_external_data=SAVE_TWO_PARTS)
-            del m
-            gc.collect()
-    else:
-        m = onnx.load(quanted_model_path)
-        onnx.save(m, quanted_model_path, save_as_external_data=SAVE_TWO_PARTS)
-        del m
-        gc.collect()
-
-
-# ==============================================================================
-# Main Processing Loop
-# ==============================================================================
-algorithm_copy = algorithm
-
-for model_name in model_names:
-    print(f"\n--- Processing model: {model_name} ---")
-
-    # Auto-select dtype and flags per model
-    if lazy_setting_GPU:
-        target_dtype = GPU_MODEL_DTYPE.get(model_name, "float16")
-        keep_io_dtype = False
-    elif lazy_setting_CPU:
-        target_dtype = CPU_MODEL_DTYPE.get(model_name, "float32")
-        keep_io_dtype = True
-    else:
-        target_dtype = None
-
-    # Reset per-iteration quantization flags
-    if target_dtype:
-        quant_int4 = (target_dtype == "int4")
-        quant_int8 = (target_dtype == "int8")
-        quant_float16 = (target_dtype == "float16")
-
-    print(f"Selected target dtype for {model_name}: {target_dtype}")
-    print(f"quant_int8={quant_int8}, quant_float16={quant_float16}, keep_io_dtype={keep_io_dtype}")
-
-    model_path = os.path.join(original_folder_path, f"{model_name}.onnx")
-    quanted_model_path = os.path.join(quanted_folder_path, f"{model_name}.onnx")
-
-    if not os.path.exists(model_path):
-        print(f"Warning: Model file not found at {model_path}. Skipping.")
-        continue
-
-    process_single_model(
-        model_path, quanted_model_path, model_name,
-        bits, block_size, quant_int4, quant_int8,
-        quant_float16, keep_io_dtype, fp16_op_block_list,
+    _restamp_bundle_metadata(optimized_bundle_dir)
+    tokenizer_assets = copy_tokenizer_assets(
+        SOURCE_BUNDLE_DIR, optimized_bundle_dir
     )
+    print(f"Copied {len(tokenizer_assets)} tokenizer assets to {optimized_bundle_dir}.")
 
 
-# ==============================================================================
-# Cleanup
-# ==============================================================================
-print("Cleaning up temporary *.onnx.data files...")
-pattern = os.path.join(quanted_folder_path, '*.onnx.data')
-files_to_delete = glob.glob(pattern)
-for file_path in files_to_delete:
-    try:
-        os.remove(file_path)
-        print(f"Deleted {file_path}")
-    except Exception as e:
-        print(f"Error deleting {file_path}: {e}")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Optimize Falcon Perception with AFFINE_REFINE_V2 MatMul and residual-corrected embedding quantization."
+    )
+    parser.add_argument("--quant-method", choices=_AFFINE_REFINE_V2_METHODS, default=QUANT_METHOD)
+    parser.add_argument(
+        "--embedding-only",
+        action="store_true",
+        help="Ablation mode: quantize only the untied token embedding and leave Main MatMul weights unquantized.",
+    )
+    parser.add_argument(
+        "--output-folder",
+        type=Path,
+        help="Output bundle directory; defaults to a method-specific folder for variant runs.",
+    )
+    return parser.parse_args()
 
-print("--- All models processed successfully! ---")
+
+def main() -> None:
+    args = parse_args()
+    output_dir = args.output_folder or _default_output_dir(
+        args.quant_method, args.embedding_only
+    )
+    if output_dir.expanduser().resolve() == SOURCE_BUNDLE_DIR.resolve():
+        raise ValueError("--output-folder must not overwrite Falcon_Perception_ONNX.")
+    optimize_bundle(args.quant_method, output_dir, args.embedding_only)
+
+
+if __name__ == "__main__":
+    main()

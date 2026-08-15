@@ -1,3 +1,4 @@
+import argparse
 import os
 import time
 
@@ -7,48 +8,46 @@ import numpy as np
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-EXPORT_DIR = os.path.join(SCRIPT_DIR, 'PPOCRv6_Optimized')
-
-# --- Recognition character-list fallback -----------------------------------------
-# The CTC character list loads from the exported rec_char_list.npy; REC_MODEL_DIR is
-# only read (via the bundled recognition processor) when that .npy file is missing.
-_WS_ROOT      = os.path.normpath(os.path.join(SCRIPT_DIR, '..', '..', '..', '..'))
-REC_MODEL_DIR = os.path.join(_WS_ROOT, 'PP-OCRv6_medium_rec_safetensors')
+SCRIPT_DIR          = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODEL_FOLDER = os.path.join(SCRIPT_DIR, 'PPOCRv6_Optimized')
+# Backward-compatible configuration alias.
+EXPORT_DIR = DEFAULT_MODEL_FOLDER
 
 # --- ONNX model paths ------------------------------------------------------------
-onnx_model_DocOri      = os.path.join(EXPORT_DIR, 'PPOCRv6_DocOri.onnx')
-onnx_model_Unwarp      = os.path.join(EXPORT_DIR, 'PPOCRv6_Unwarp.onnx')
-onnx_model_Det         = os.path.join(EXPORT_DIR, 'PPOCRv6_Det.onnx')
-onnx_model_Rec         = os.path.join(EXPORT_DIR, 'PPOCRv6_Rec.onnx')
-onnx_model_DBPost      = os.path.join(EXPORT_DIR, 'PPOCRv6_DBPost.onnx')
+onnx_model_DocOri = os.path.join(EXPORT_DIR, 'PPOCRv6_DocOri.onnx')
+onnx_model_Unwarp = os.path.join(EXPORT_DIR, 'PPOCRv6_Unwarp.onnx')
+onnx_model_Det    = os.path.join(EXPORT_DIR, 'PPOCRv6_Det.onnx')
+onnx_model_Rec    = os.path.join(EXPORT_DIR, 'PPOCRv6_Rec.onnx')
+onnx_model_DBPost = os.path.join(EXPORT_DIR, 'PPOCRv6_DBPost.onnx')
 
 # --- Pipeline stage toggles ------------------------------------------------------
-USE_DOC_ORI          = True      # Document orientation classification (runtime stage)
-USE_UNWARP           = True      # UVDoc unwarping (runtime stage)
-USE_TEXTLINE_ORI     = True      # Text-line orientation (fused into rec; sets the int8 use_textline switch)
+USE_DOC_ORI      = True            # Document orientation classification (runtime stage).
+USE_UNWARP       = True            # UVDoc unwarping (runtime stage).
+USE_TEXTLINE_ORI = True            # Text-line orientation and recognition switch.
 
 # --- ONNX / runtime --------------------------------------------------------------
-ORT_Accelerate_Providers = []      # e.g. ['CUDAExecutionProvider'], ['DmlExecutionProvider']
-MAX_THREADS              = 0       # 0 = auto
+ORT_Accelerate_Providers = []      # e.g. ['CUDAExecutionProvider'], ['DmlExecutionProvider'].
+MAX_THREADS              = 0       # 0 = auto.
 DEVICE_ID                = 0
 ORT_LOG                  = False
 ORT_FP16                 = False
 
 # --- Recognition batching --------------------------------------------------------
-REC_MAX_WIDTH        = 3200
-REC_BATCH_SIZE       = 8          # max crops per recognition batch
+REC_MAX_WIDTH  = 3200
+REC_BATCH_SIZE = 8                 # Maximum crops per recognition batch.
 
 # --- Demo image ------------------------------------------------------------------
-DEMO_IMAGE_PATH   = os.path.join(SCRIPT_DIR, 'general_ocr_002.png')
-OUTPUT_DIR        = os.path.join(SCRIPT_DIR, 'output')
-VISUALIZE_OUTPUT = True
+DEFAULT_IMAGE      = os.path.join(SCRIPT_DIR, 'general_ocr_002.png')
+DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'output')
+# Backward-compatible configuration aliases.
+DEMO_IMAGE_PATH     = DEFAULT_IMAGE
+OUTPUT_DIR          = DEFAULT_OUTPUT_DIR
+VISUALIZE_OUTPUT    = True
 VIS_LABEL_FONT_SIZE = 15
 # Visualization font candidates, tried in order (first existing file wins; see
-# _load_visualization_font). PPOCR_VIS_FONT overrides, then the host-OS CJK fonts so
-# labels render correctly on Windows or Linux without edits.
+# _load_visualization_font).
 if os.name == 'nt':
-    _SYS_FONTS_DIR = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'Fonts')
+    _SYS_FONTS_DIR = os.path.join(r'C:\Windows', 'Fonts')
     _PLATFORM_FONT_CANDIDATES = (
         os.path.join(_SYS_FONTS_DIR, 'msyh.ttc'),    # Microsoft YaHei (Simplified Chinese)
         os.path.join(_SYS_FONTS_DIR, 'msyh.ttf'),    # Microsoft YaHei (older single-face)
@@ -64,9 +63,12 @@ else:
         '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
         '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
     )
-VIS_FONT_CANDIDATES = (os.environ.get('PPOCR_VIS_FONT', ''),) + _PLATFORM_FONT_CANDIDATES
+VIS_FONT_CANDIDATES = ('',) + _PLATFORM_FONT_CANDIDATES
 
-REC_CHAR_LIST     = None          # populated from the recognition processor at load time
+def parse_args():
+    parser = argparse.ArgumentParser(description='Run PP-OCRv6 ONNX inference.')
+    parser.add_argument('--model-folder', default=DEFAULT_MODEL_FOLDER)
+    return parser.parse_args()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -270,34 +272,30 @@ def save_ocr_visualization(image_hwc, result, save_path):
 class PPOCRv6Pipeline:
     """End-to-end PP-OCRv6 OCR over persistent ONNXRuntime sessions."""
 
-    _STAGES = (
-        ('doc_ori', onnx_model_DocOri, lambda: USE_DOC_ORI),
-        ('unwarp',  onnx_model_Unwarp, lambda: USE_UNWARP),
-        ('det',     onnx_model_Det,    lambda: True),
-        ('rec',     onnx_model_Rec,    lambda: True),
-    )
-    _AUX_STAGES = (
-        ('db_post', onnx_model_DBPost),
-    )
-
     def __init__(self):
         char_path = os.path.join(EXPORT_DIR, 'rec_char_list.npy')
         if os.path.exists(char_path):
             self.char_list = list(np.load(char_path, allow_pickle=True))
-        elif REC_CHAR_LIST is not None:
-            self.char_list = REC_CHAR_LIST
         else:
-            from transformers import AutoImageProcessor
-            self.char_list = list(AutoImageProcessor.from_pretrained(REC_MODEL_DIR).character_list)
+            raise FileNotFoundError(
+                f'Missing bundled recognition character list: {char_path}. '
+                'Re-export the complete PP-OCRv6 ONNX bundle.'
+            )
 
         self.sessions, self.bindings, self.io = {}, {}, {}
-        for tag, path, enabled in self._STAGES:
+        stages = (
+            ('doc_ori', onnx_model_DocOri, lambda: USE_DOC_ORI),
+            ('unwarp',  onnx_model_Unwarp, lambda: USE_UNWARP),
+            ('det',     onnx_model_Det,    lambda: True),
+            ('rec',     onnx_model_Rec,    lambda: True),
+        )
+        for tag, path, enabled in stages:
             if enabled() and os.path.exists(path):
                 session = create_session(path, **packed_settings)
                 self.sessions[tag] = session
                 self.bindings[tag] = session.io_binding()
                 self.io[tag] = (get_in_names(session), get_out_names(session))
-        for tag, path in self._AUX_STAGES:
+        for tag, path in (('db_post', onnx_model_DBPost),):
             if os.path.exists(path):
                 session = create_session(path, **packed_settings)
                 self.sessions[tag] = session
@@ -339,7 +337,8 @@ class PPOCRv6Pipeline:
         angle, which is pulled back to the host only for reporting.
         """
         image_oriented, angle = self._infer_ort('doc_ori', image_ort)
-        return image_oriented, int(angle.numpy())
+        angle_value = int(angle.numpy().flat[0])
+        return image_oriented, angle_value
 
     def _aux_ready(self):
         required = {'db_post', 'rec'}
@@ -447,10 +446,12 @@ class PPOCRv6Pipeline:
 # ══════════════════════════════════════════════════════════════════════════════
 # DEMO ENTRYPOINT
 # ══════════════════════════════════════════════════════════════════════════════
-def main():
+def run_inference(image_path=None, output_dir=None):
+    """Run the PP-OCRv6 ONNX pipeline and save its result artifacts."""
     import json
 
-    image_path = DEMO_IMAGE_PATH
+    image_path = DEMO_IMAGE_PATH if image_path is None else os.fspath(image_path)
+    output_dir = OUTPUT_DIR if output_dir is None else os.fspath(output_dir)
     image_nchw = load_rgb_uint8(image_path)
     original_image_hwc = np.ascontiguousarray(image_nchw[0].transpose(1, 2, 0))
 
@@ -460,9 +461,9 @@ def main():
     result = pipeline.predict(image_nchw)
     elapsed = time.time() - start
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_json = os.path.join(OUTPUT_DIR, 'general_ocr_002_onnx_res.json')
-    out_vis = os.path.join(OUTPUT_DIR, 'general_ocr_002_onnx_ocr_res_img.png')
+    os.makedirs(output_dir, exist_ok=True)
+    out_json = os.path.join(output_dir, 'general_ocr_002_onnx_res.json')
+    out_vis = os.path.join(output_dir, 'general_ocr_002_onnx_ocr_res_img.png')
 
     json_result = result.copy()
     visual_image = json_result.pop('_visual_image', None)
@@ -486,6 +487,24 @@ def main():
     print(f'\nResult JSON -> {out_json}')
     if VISUALIZE_OUTPUT:
         print(f'Visualization -> {out_vis}')
+    return json_result
+
+
+def configure_model_folder(model_folder):
+    """Point the pipeline at one complete PP-OCRv6 ONNX bundle."""
+    global EXPORT_DIR, onnx_model_DocOri, onnx_model_Unwarp, onnx_model_Det, onnx_model_Rec, onnx_model_DBPost
+    EXPORT_DIR = os.path.abspath(os.fspath(model_folder))
+    onnx_model_DocOri = os.path.join(EXPORT_DIR, 'PPOCRv6_DocOri.onnx')
+    onnx_model_Unwarp = os.path.join(EXPORT_DIR, 'PPOCRv6_Unwarp.onnx')
+    onnx_model_Det = os.path.join(EXPORT_DIR, 'PPOCRv6_Det.onnx')
+    onnx_model_Rec = os.path.join(EXPORT_DIR, 'PPOCRv6_Rec.onnx')
+    onnx_model_DBPost = os.path.join(EXPORT_DIR, 'PPOCRv6_DBPost.onnx')
+
+
+def main():
+    args = parse_args()
+    configure_model_folder(args.model_folder)
+    run_inference()
 
 
 if __name__ == '__main__':
